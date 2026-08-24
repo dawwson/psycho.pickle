@@ -745,7 +745,7 @@ async def _notify_job(
                 "message_id": response.get("MessageId"),
             }
             logger.info(
-                "✅ Successfully sent completion notification to SQS for job_id={}",
+                "Successfully sent completion notification to SQS for job_id=%s",
                 job_id,
             )
         else:
@@ -774,7 +774,7 @@ async def _notify_job(
             success_payload = {**destination_payload, "payload": notify_payload}
     except Exception as exc:
         logger.error(
-            "❌ Failed to send completion notification to SQS for job_id={}",
+            "Failed to send completion notification to SQS for job_id=%s",
             job_id,
             exc_info=exc,
         )

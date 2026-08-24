@@ -73,7 +73,6 @@ dmypy.json
 */.DS_Store
 
 # AI
-AGENTS.md
 CLAUDE.md
 GEMINI.md
 .codex/

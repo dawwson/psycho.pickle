@@ -18,11 +18,16 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "aiosqlite>=0.21.0",
     "basedpyright>=1.38.2",
+    "greenlet>=3.1.1",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
+    "pytest-asyncio>=1.0.0",
     "ruff>=0.15.6",
 ]
 
 [tool.pytest.ini_options]
+# pytest가 async test와 async fixture를 asyncio event loop에서 실행한다.
+asyncio_mode = "auto"
 pythonpath = ["."]
