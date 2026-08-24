@@ -12,6 +12,7 @@ async def test_database_fixture_persists_job(
     db_session_factory: async_sessionmaker[AsyncSession],
     job_factory: Callable[..., Job],
 ):
+    """테스트 DB에 저장한 Job을 새로운 session에서도 조회할 수 있다."""
     # @pytest.mark.asyncio는 pytest가 async test를 event loop에서 실행하게 한다.
     # session.begin()이 정상 종료되면 transaction이 commit된다.
     async with db_session_factory() as session:
