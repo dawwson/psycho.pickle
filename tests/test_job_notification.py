@@ -1,6 +1,6 @@
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,12 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.constants import (
     OPENAI_STATE_COMPLETED,
+    POSTPROCESS_STATE_NOTIFY_FAILED,
+    POSTPROCESS_STATE_NOTIFY_IN_PROGRESS,
     POSTPROCESS_STATE_NOTIFY_PENDING,
     POSTPROCESS_STATE_NOTIFY_SUCCEEDED,
 )
 from app.models import Job, JobEvent
 from app.services import job as job_service
-from app.services.job import process_postprocess_work
+from app.services.job import claim_due_postprocess_work, process_postprocess_work
 
 TestSessionFactory = async_sessionmaker[AsyncSession]
 
@@ -117,26 +119,79 @@ async def test_sqs_notification_success_marks_job_succeeded(
 
 
 @pytest.mark.asyncio
-async def test_sqs_notification_failure_is_interrupted_by_logging_error(
+async def test_sqs_notification_failure_schedules_retry(
     db_session_factory: TestSessionFactory,
     job_factory: Callable[..., Job],
     fake_sqs_factory: Callable[..., Any],
     notify_settings: SimpleNamespace,
 ):
-    """현재 통지 실패 경로는 logging 오류로 상태 저장 전에 중단된다."""
+    """SQS 결과 통지가 실패하면 오류를 저장하고 다음 재시도를 예약한다."""
     job_id = await persist_notify_pending_job(db_session_factory, job_factory)
     sqs = fake_sqs_factory(error=TimeoutError("SQS timeout"))
+    before_attempt = datetime.now(UTC)
 
-    # service의 logger.error 메시지는 logging이 요구하는 %s 대신 {}를 사용한다.
-    # pytest logging handler가 이를 formatting할 때 TypeError가 발생하는 현재
-    # 결함을 숨기지 않고 characterization test로 기록한다.
-    with pytest.raises(TypeError, match="not all arguments converted"):
-        await process_postprocess_work("notify", job_id, sqs_client=sqs)
+    await process_postprocess_work("notify", job_id, sqs_client=sqs)
 
     job, events = await load_job_with_events(db_session_factory, job_id)
     assert len(sqs.requests) == 1
-    assert job.postprocess_state == POSTPROCESS_STATE_NOTIFY_PENDING
-    assert job.notify_attempts == 0
-    assert job.postprocess_error is None
+    assert job.postprocess_state == POSTPROCESS_STATE_NOTIFY_FAILED
+    assert job.notify_attempts == 1
+    assert job.postprocess_error == "SQS timeout"
+    assert job.postprocess_error_payload is not None
+    assert job.next_retry_at is not None
+    # SQLite는 timezone 정보가 있는 datetime도 조회할 때 naive datetime으로
+    # 반환하므로 같은 형태로 맞춘 뒤 미래 시각인지 비교한다.
+    assert job.next_retry_at > before_attempt.replace(tzinfo=None)
     assert job.notified_at is None
-    assert [event.event_type for event in events] == ["notify_attempt"]
+    assert [event.event_type for event in events] == [
+        "notify_attempt",
+        "notify_failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_is_claimed_and_succeeds_on_retry(
+    db_session_factory: TestSessionFactory,
+    job_factory: Callable[..., Job],
+    fake_sqs_factory: Callable[..., Any],
+    notify_settings: SimpleNamespace,
+):
+    """재시도 시각이 지난 통지 실패 Job을 선점해 다시 성공 처리한다."""
+    job_id = await persist_notify_pending_job(db_session_factory, job_factory)
+    failed_sqs = fake_sqs_factory(error=TimeoutError("temporary SQS failure"))
+    recovered_sqs = fake_sqs_factory()
+
+    await process_postprocess_work("notify", job_id, sqs_client=failed_sqs)
+
+    # 실패 직후 next_retry_at은 미래이므로 아직 claim되지 않는다. 테스트에서는
+    # 시간이 지난 상황을 만들기 위해 DB 시각만 과거로 이동한다.
+    async with db_session_factory() as session:
+        async with session.begin():
+            job = await session.get(Job, job_id)
+            assert job is not None
+            job.next_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    # claim은 실행 가능한 Job을 찾아 notify_in_progress로 바꾸고 lease를 잡는다.
+    # worker는 반환된 (work kind, job ID) 목록을 실제 처리 함수에 전달한다.
+    work_items = await claim_due_postprocess_work(1)
+
+    claimed_job, _ = await load_job_with_events(db_session_factory, job_id)
+    assert work_items == [("notify", job_id)]
+    assert claimed_job.postprocess_state == POSTPROCESS_STATE_NOTIFY_IN_PROGRESS
+
+    await process_postprocess_work("notify", job_id, sqs_client=recovered_sqs)
+
+    job, events = await load_job_with_events(db_session_factory, job_id)
+    assert len(failed_sqs.requests) == 1
+    assert len(recovered_sqs.requests) == 1
+    assert job.postprocess_state == POSTPROCESS_STATE_NOTIFY_SUCCEEDED
+    assert job.notify_attempts == 2
+    assert job.postprocess_error is None
+    assert job.postprocess_error_payload is None
+    assert job.next_retry_at is None
+    assert [event.event_type for event in events] == [
+        "notify_attempt",
+        "notify_failed",
+        "notify_attempt",
+        "notify_succeeded",
+    ]
